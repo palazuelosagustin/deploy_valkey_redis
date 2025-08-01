@@ -240,6 +240,7 @@ sentinel auth-user mymaster sentinel-user
 sentinel auth-pass mymaster $PASSWORD
 sentinel down-after-milliseconds mymaster 5000
 sentinel failover-timeout mymaster 10000
+user default on >$PASSWORD ~* &* +@all
 EOF
 }
 
@@ -441,7 +442,7 @@ print_final_status() {
             echo "  # Connect to Master:"
             echo "  docker run --rm -it --network ${NETWORK_NAME} ${IMAGE_NAME}:${VERSION} ${CLI_COMMAND} -h $(get_container_data "${BASE_CONTAINER_NAME}-node-0" 'ip') -a $PASSWORD"
             echo "  # Connect via Sentinel (for failover):"
-            echo "  docker run --rm -it --network ${NETWORK_NAME} ${IMAGE_NAME}:${VERSION} ${CLI_COMMAND} -h $(get_container_data "${BASE_CONTAINER_NAME}-sentinel-1" 'ip') -p 26379 -a $PASSWORD sentinel get-master-addr-by-name mymaster"
+            echo "  docker run --rm -it --network ${NETWORK_NAME} ${IMAGE_NAME}:${VERSION} ${CLI_COMMAND} -h $(get_container_data "${BASE_CONTAINER_NAME}-sentinel-1" 'ip') -p 26379 -a $PASSWORD"
             ;;
         cluster)
             echo "  # Connect to any node in the cluster with -c for cluster mode:"
