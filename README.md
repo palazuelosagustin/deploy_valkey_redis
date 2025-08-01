@@ -13,7 +13,7 @@ Bash script to deploy different flavors of redis and valkey with dcocker contain
 Deploys Redis or Valkey with various topologies using Docker.
 
 Usage:
-  $0 -r <repo> -t <type> [OPTIONS]
+  deploy_valkey_redis.sh -r <repo> -t <type> [OPTIONS]
 
 Required Arguments:
   -r <repo>           Specify the repository: 'redis' or 'valkey'.
