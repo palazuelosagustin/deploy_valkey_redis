@@ -45,4 +45,4 @@ Example:
   
   deploy_valkey_redis.sh -c -r valkey -t cluster -S 3 -R 1 -N my-cluster
   
-  deploy_valkey_redis.sh -c -r valkey -t cluster -S 3 -R 1 -N my-cluster
+  deploy_valkey_redis.sh -c -N my-cluster
