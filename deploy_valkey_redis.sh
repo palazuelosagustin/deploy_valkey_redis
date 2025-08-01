@@ -8,7 +8,7 @@ if ! command -v docker &> /dev/null; then
 fi
 
 # --- Script Configuration & Defaults ---
-BASE_DIR_PREFIX="$HOME/deploy_redis_valkey" # Renamed to avoid conflict
+BASE_DIR_PREFIX="$HOME" # Renamed to avoid conflict
 REPO=""
 FLAVOR=""
 TYPE=""
@@ -449,6 +449,10 @@ print_final_status() {
             echo "  docker run --rm -it --network ${NETWORK_NAME} ${IMAGE_NAME}:${VERSION} ${CLI_COMMAND} -c -h $(get_container_data "${BASE_CONTAINER_NAME}-sh0-node0" 'ip') -a $PASSWORD"
             ;;
     esac
+
+    echo " "
+    echo "  # All files were created on: $BASE_DIR"
+
     echo -e "${YELLOW}------------------------------------------------------------------${NC}"
 }
 
