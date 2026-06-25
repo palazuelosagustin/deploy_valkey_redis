@@ -22,6 +22,7 @@ PASSWORD="${DEPLOY_VALKEY_REDIS_PASSWORD:-}"
 NAME_SUFFIX=""
 AUTO_CLEANUP_ON_ERROR=false
 TLS_ENABLED=false
+LDAP_ENABLED=false
 
 # --- Variables set dynamically in main() ---
 DEPLOYMENT_ID=""
@@ -29,6 +30,8 @@ BASE_DIR=""
 NETWORK_NAME=""
 BASE_CONTAINER_NAME=""
 TLS_DIR=""
+LDAP_DIR=""
+LDAP_CONTAINER_NAME=""
 
 # --- Global Variables (set by functions) ---
 NETWORK_SUBNET=""
@@ -40,6 +43,17 @@ JSON_MODULE=""
 BLOOM_MODULE=""
 SEARCH_MODULE=""
 CLI_TLS_ARGS=()
+LDAP_MODULE=""
+LDAP_DOMAIN="example.org"
+LDAP_BASE_DN="dc=example,dc=org"
+LDAP_ORGANISATION="Valkey LDAP Lab"
+LDAP_ADMIN_PASSWORD=""
+LDAP_USERS=(
+    "user1:User One:user1@example.org:user1pass"
+    "user2:User Two:user2@example.org:user2pass"
+    "user3:User Three:user3@example.org:user3pass"
+    "user4:User Four:user4@example.org:user4pass"
+)
 
 # --- Color Codes ---
 GREEN='\033[0;32m'
@@ -83,6 +97,7 @@ Options:
   -R <num>            Number of replicas per shard for a cluster (default: 0).
   -p <password>       Password for Redis/Valkey auth. If omitted, one is generated.
   -T                  Enable TLS. Certificates are generated automatically with OpenSSL.
+  -l                  Enable Valkey LDAP auth and deploy an OpenLDAP test service with 4 users.
   -c                  Clean up a specific deployment before starting a new one.
   -h                  Show this help message.
 
@@ -91,6 +106,7 @@ Example:
   $0 -c -r valkey -t cluster -S 3 -R 1 -N my-cluster
   DEPLOY_VALKEY_REDIS_PASSWORD=secret123 $0 -c -r valkey -t standalone -N my-dev
   $0 -T -r redis -t standalone -N tls-demo
+  $0 -l -r valkey -t standalone -N ldap-demo
 
 Available tags:
 valkey:             8.1.1, 8.1, 8
@@ -221,6 +237,14 @@ validate_inputs() {
 
     if [[ "$TLS_ENABLED" == true ]] && ! command -v openssl >/dev/null 2>&1; then
         log_error "OpenSSL is required when TLS is enabled."
+    fi
+
+    if [[ "$LDAP_ENABLED" == true && "$REPO" != "valkey" ]]; then
+        log_error "LDAP mode is only supported for Valkey deployments."
+    fi
+
+    if [[ "$LDAP_ENABLED" == true && -z "$LDAP_ADMIN_PASSWORD" ]]; then
+        LDAP_ADMIN_PASSWORD="$(generate_password)"
     fi
 }
 
@@ -372,6 +396,111 @@ generate_tls_materials() {
     chmod 644 "${TLS_DIR}/ca.crt" "${TLS_DIR}/server.crt" "${TLS_DIR}/client.crt" "$openssl_config"
 }
 
+create_ldap_bootstrap_ldif() {
+    local ldif_path="$1"
+
+    cat > "$ldif_path" <<EOF
+dn: ou=people,${LDAP_BASE_DN}
+objectClass: organizationalUnit
+ou: people
+
+EOF
+
+    local ldap_user
+    for ldap_user in "${LDAP_USERS[@]}"; do
+        IFS=':' read -r username full_name email user_password <<< "$ldap_user"
+        local surname="${full_name##* }"
+        cat >> "$ldif_path" <<EOF
+dn: uid=${username},ou=people,${LDAP_BASE_DN}
+objectClass: inetOrgPerson
+objectClass: organizationalPerson
+objectClass: person
+objectClass: top
+cn: ${full_name}
+sn: ${surname}
+uid: ${username}
+mail: ${email}
+userPassword: ${user_password}
+
+EOF
+    done
+
+    chmod 644 "$ldif_path"
+}
+
+wait_for_ldap_ready() {
+    log_info "Waiting for '$LDAP_CONTAINER_NAME' to be ready..."
+
+    for _ in {1..30}; do
+        if docker exec "$LDAP_CONTAINER_NAME" ldapwhoami -x \
+            -H "ldap://127.0.0.1:389" \
+            -D "cn=admin,${LDAP_BASE_DN}" \
+            -w "$LDAP_ADMIN_PASSWORD" >/dev/null 2>&1; then
+            log_info "'$LDAP_CONTAINER_NAME' is ready."
+            return 0
+        fi
+        sleep 1
+    done
+
+    log_error "'$LDAP_CONTAINER_NAME' did not become ready in time."
+}
+
+deploy_ldap_service() {
+    if [[ "$LDAP_ENABLED" != true ]]; then
+        return 0
+    fi
+
+    local ip_base ldap_ip
+    ip_base=$(echo "$NETWORK_SUBNET" | cut -d'/' -f1 | cut -d'.' -f1-3)
+    ldap_ip="${ip_base}.200"
+
+    LDAP_DIR="${BASE_DIR}/ldap"
+    LDAP_CONTAINER_NAME="${BASE_CONTAINER_NAME}-ldap"
+    mkdir -p "${LDAP_DIR}"
+    chmod 755 "${LDAP_DIR}"
+    create_ldap_bootstrap_ldif "${LDAP_DIR}/users.ldif"
+
+    log_info "Starting LDAP container '$LDAP_CONTAINER_NAME' with IP ${ldap_ip}..."
+    docker run -d --restart always \
+        --name "$LDAP_CONTAINER_NAME" \
+        --network "$NETWORK_NAME" \
+        --ip "$ldap_ip" \
+        --label "db-deploy-script=true" \
+        --label "deployment_id=${DEPLOYMENT_ID}" \
+        -e "LDAP_ORGANISATION=${LDAP_ORGANISATION}" \
+        -e "LDAP_DOMAIN=${LDAP_DOMAIN}" \
+        -e "LDAP_ADMIN_PASSWORD=${LDAP_ADMIN_PASSWORD}" \
+        osixia/openldap:1.5.0 >/dev/null
+
+    wait_for_ldap_ready
+    docker cp "${LDAP_DIR}/users.ldif" "${LDAP_CONTAINER_NAME}:/tmp/users.ldif"
+    docker exec "$LDAP_CONTAINER_NAME" ldapadd -x \
+        -H "ldap://127.0.0.1:389" \
+        -D "cn=admin,${LDAP_BASE_DN}" \
+        -w "$LDAP_ADMIN_PASSWORD" \
+        -f /tmp/users.ldif >/dev/null
+}
+
+configure_ldap_for_node() {
+    local container_name="$1"
+    local ldap_server_ip
+
+    if [[ "$LDAP_ENABLED" != true ]]; then
+        return 0
+    fi
+
+    ldap_server_ip="$(get_container_data "$LDAP_CONTAINER_NAME" "ip")"
+    log_info "Configuring LDAP module on '$container_name'..."
+    docker exec "$container_name" "$CLI_COMMAND" "${CLI_TLS_ARGS[@]}" --no-auth-warning -a "$PASSWORD" \
+        CONFIG SET ldap.servers "ldap://${ldap_server_ip}:389" >/dev/null
+    docker exec "$container_name" "$CLI_COMMAND" "${CLI_TLS_ARGS[@]}" --no-auth-warning -a "$PASSWORD" \
+        CONFIG SET ldap.auth_mode bind >/dev/null
+    docker exec "$container_name" "$CLI_COMMAND" "${CLI_TLS_ARGS[@]}" --no-auth-warning -a "$PASSWORD" \
+        CONFIG SET ldap.bind_dn_prefix "uid=" >/dev/null
+    docker exec "$container_name" "$CLI_COMMAND" "${CLI_TLS_ARGS[@]}" --no-auth-warning -a "$PASSWORD" \
+        CONFIG SET ldap.bind_dn_suffix ",ou=people,${LDAP_BASE_DN}" >/dev/null
+}
+
 create_network() {
     # First, check if the network already exists to avoid re-creating it
     if docker network inspect "$NETWORK_NAME" &>/dev/null; then
@@ -422,13 +551,19 @@ set_image_config() {
         CLI_COMMAND="valkey-cli"
         SENTINEL_COMMAND="valkey-sentinel"
         BINARY="valkey-server"
-        if [[ "$FLAVOR" == "extensions" ]]; then
+        if [[ "$LDAP_ENABLED" == true ]]; then
+            IMAGE_NAME="valkey/valkey-bundle"
+            LDAP_MODULE="loadmodule /usr/lib/valkey/libvalkey_ldap.so"
+        elif [[ "$FLAVOR" == "extensions" ]]; then
             IMAGE_NAME="valkey/valkey-extensions"
+        else
+            IMAGE_NAME="valkey/valkey"
+        fi
+
+        if [[ "$FLAVOR" == "extensions" || "$LDAP_ENABLED" == true ]]; then
             JSON_MODULE="loadmodule /usr/lib/valkey/libjson.so"
             BLOOM_MODULE="loadmodule /usr/lib/valkey/libvalkey_bloom.so"
             SEARCH_MODULE="loadmodule /usr/lib/valkey/libsearch.so"
-        else
-            IMAGE_NAME="valkey/valkey"
         fi
     else
         log_error "Invalid repo: '$REPO'. Must be 'redis' or 'valkey'."
@@ -486,6 +621,7 @@ EOF
     [[ -n "$JSON_MODULE" ]] && echo "$JSON_MODULE" >> "$config_path"
     [[ -n "$BLOOM_MODULE" ]] && echo "$BLOOM_MODULE" >> "$config_path"
     [[ -n "$SEARCH_MODULE" ]] && echo "$SEARCH_MODULE" >> "$config_path"
+    [[ -n "$LDAP_MODULE" ]] && echo "$LDAP_MODULE" >> "$config_path"
     chmod 644 "$config_path"
 }
 
@@ -507,6 +643,15 @@ user sentinel-user on >$PASSWORD allchannels -@all +multi +slaveof +ping +exec +
 EOF
             ;;
     esac
+
+    if [[ "$LDAP_ENABLED" == true ]]; then
+        local ldap_user
+        for ldap_user in "${LDAP_USERS[@]}"; do
+            IFS=':' read -r username _full_name _email _user_password <<< "$ldap_user"
+            echo "user ${username} on resetpass ~* &* +@all" >> "$acl_path"
+        done
+    fi
+
     chmod 644 "$acl_path"
 }
 
@@ -606,6 +751,7 @@ deploy_standalone() {
     create_acl_file "${dir}/config/users.acl" "standalone"
     run_node "$container_name" "$dir" "server" "$ip"
     wait_for_ready "$container_name" -a "$PASSWORD"
+    configure_ldap_for_node "$container_name"
 }
 
 deploy_replica_set() {
@@ -623,6 +769,7 @@ deploy_replica_set() {
     create_acl_file "${master_dir}/config/users.acl" "replica"
     run_node "$container_name" "$master_dir" "server" "$master_ip"
     wait_for_ready "$container_name" -a "$PASSWORD"
+    configure_ldap_for_node "$container_name"
 
     # Deploy Replicas
     for i in $(seq 1 "$REPLICAS"); do
@@ -635,6 +782,7 @@ deploy_replica_set() {
         cp "${master_dir}/config/users.acl" "${replica_dir}/config/users.acl"
         run_node "$container_name" "$replica_dir" "server" "$replica_ip"
         wait_for_ready "$container_name" -a "$PASSWORD"
+        configure_ldap_for_node "$container_name"
     done
 
     # Deploy Sentinels
@@ -673,6 +821,7 @@ deploy_cluster() {
         create_acl_file "${master_dir}/config/users.acl" "cluster"
         run_node "$container_name" "$master_dir" "server" "$master_ip"
         wait_for_ready "$container_name" -a "$PASSWORD"
+        configure_ldap_for_node "$container_name"
     done
 
     # Wait for all masters and build seeds list
@@ -703,6 +852,7 @@ deploy_cluster() {
                 cp "${BASE_DIR}/shard${i}/node0/config/users.acl" "${replica_dir}/config/users.acl"
                 run_node "$container_name" "$replica_dir" "server" "$replica_ip"
                 wait_for_ready "$container_name" -a "$PASSWORD"
+                configure_ldap_for_node "$container_name"
 
                 log_info "Adding node $container_name as replica for $master_name"
                 local master_id
@@ -729,6 +879,24 @@ print_final_status() {
         docker exec "${BASE_CONTAINER_NAME}-sh0-node0" "$CLI_COMMAND" "${CLI_TLS_ARGS[@]}" --no-auth-warning -a "$PASSWORD" CLUSTER NODES
     fi
 
+    if [[ "$LDAP_ENABLED" == true ]]; then
+        echo -e "${YELLOW}------------------------------------------------------------------${NC}"
+        log_info "LDAP Test Service:"
+        echo "  LDAP URI: ldap://$(get_container_data "${LDAP_CONTAINER_NAME}" 'ip'):389"
+        echo "  Base DN: ${LDAP_BASE_DN}"
+        echo "  Admin DN: cn=admin,${LDAP_BASE_DN}"
+        echo "  Admin Password: ${LDAP_ADMIN_PASSWORD}"
+        echo "  Example query:"
+        echo "  docker exec -it ${LDAP_CONTAINER_NAME} ldapsearch -x -H ldap://127.0.0.1:389 -D \"cn=admin,${LDAP_BASE_DN}\" -w ${LDAP_ADMIN_PASSWORD} -b \"ou=people,${LDAP_BASE_DN}\" \"(uid=user1)\" uid cn mail"
+        echo "  Test users:"
+        local ldap_user
+        for ldap_user in "${LDAP_USERS[@]}"; do
+            IFS=':' read -r username full_name email user_password <<< "$ldap_user"
+            echo "    ${username} / ${user_password} (${email})"
+        done
+        echo "  Valkey LDAP auth is enabled through the official valkey-ldap module."
+    fi
+
     echo -e "${YELLOW}------------------------------------------------------------------${NC}"
     log_info "Connect using ${CLI_COMMAND}:"
     echo "  Password: $PASSWORD"
@@ -741,6 +909,10 @@ print_final_status() {
                 echo "  docker exec -it ${BASE_CONTAINER_NAME}-standalone ${CLI_COMMAND} --tls --cacert /tls/ca.crt -h $(get_container_data "${BASE_CONTAINER_NAME}-standalone" 'ip') -a $PASSWORD"
             else
                 echo "  docker run --rm -it --network ${NETWORK_NAME} ${IMAGE_NAME}:${VERSION} ${CLI_COMMAND} -h $(get_container_data "${BASE_CONTAINER_NAME}-standalone" 'ip') -a $PASSWORD"
+            fi
+            if [[ "$LDAP_ENABLED" == true ]]; then
+                echo "  # LDAP auth test:"
+                echo "  docker exec -it ${BASE_CONTAINER_NAME}-standalone ${CLI_COMMAND} --user user1 --pass user1pass PING"
             fi
             ;;
         replica)
@@ -779,7 +951,7 @@ print_final_status() {
 main() {
     trap handle_error ERR
 
-    while getopts ":r:t:f:v:n:s:S:R:N:p:Tch" opt; do
+    while getopts ":r:t:f:v:n:s:S:R:N:p:Tlch" opt; do
         case ${opt} in
             r) REPO="$OPTARG" ;;
             t) TYPE="$OPTARG" ;;
@@ -792,6 +964,7 @@ main() {
             N) NAME_SUFFIX="$OPTARG" ;;
             p) PASSWORD="$OPTARG" ;;
             T) TLS_ENABLED=true ;;
+            l) LDAP_ENABLED=true ;;
             c) CLEAN_PREVIOUS=true ;;
             h) usage ;;
             \?) log_error "Invalid option: -$OPTARG" ;;
@@ -822,6 +995,7 @@ main() {
     AUTO_CLEANUP_ON_ERROR=true
     create_network
     generate_tls_materials
+    deploy_ldap_service
 
     case "$TYPE" in
         standalone) deploy_standalone ;;

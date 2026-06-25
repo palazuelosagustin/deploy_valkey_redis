@@ -32,6 +32,7 @@ Options:
     -R <num>            Number of replicas per shard for a cluster (default: 0).
     -p <password>       Password for Redis/Valkey auth. If omitted, one is generated.
     -T                  Enable TLS. Certificates are generated automatically with OpenSSL.
+    -l                  Enable Valkey LDAP auth and deploy an OpenLDAP test service with 4 users.
     -c                  Clean up a specific deployment before starting a new one.
     -h                  Show this help message.
 
@@ -43,6 +44,9 @@ Behavior notes:
     - You can also provide the password through the DEPLOY_VALKEY_REDIS_PASSWORD environment variable.
     - TLS mode creates a local CA plus server/client certificates under the deployment directory.
     - TLS mode configures Redis or Valkey to use TLS-only listeners and TLS for replica, sentinel, and cluster traffic.
+    - LDAP mode is available only for Valkey and uses the official valkey-ldap module.
+    - LDAP mode switches the deployment image to `valkey/valkey-bundle`, which includes `libvalkey_ldap.so`.
+    - LDAP users must also exist in Valkey ACLs, so the script creates matching ACL users for the 4 seeded LDAP accounts.
 
 Example:
 
@@ -50,6 +54,7 @@ Example:
     deploy_valkey_redis.sh -c -r valkey -t cluster -S 3 -R 1 -N my-cluster
     DEPLOY_VALKEY_REDIS_PASSWORD=secret123 ./deploy_valkey_redis.sh -c -r valkey -t standalone -N my-dev
     ./deploy_valkey_redis.sh -T -r redis -t standalone -N tls-demo
+    ./deploy_valkey_redis.sh -l -r valkey -t standalone -N ldap-demo
 
 TLS notes:
 
@@ -57,3 +62,10 @@ TLS notes:
     - The script stores TLS assets under <deployment-dir>/tls.
     - The final summary prints the CA certificate path and TLS-aware client commands.
     - TLS client authentication is disabled, but the generated CA and client certificate are still created for local testing.
+
+LDAP notes:
+
+    - LDAP mode starts an OpenLDAP container on the same Docker network as the Valkey deployment.
+    - The LDAP directory uses the base DN dc=example,dc=org and creates user1 through user4 under ou=people.
+    - The script configures the Valkey LDAP module in bind mode with `uid=` and `,ou=people,dc=example,dc=org`.
+    - The final summary prints the LDAP URI, admin DN, admin password, an example ldapsearch command, and the seeded test users.
