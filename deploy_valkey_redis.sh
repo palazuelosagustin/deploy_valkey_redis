@@ -227,7 +227,8 @@ validate_inputs() {
 prepare_node_dirs() {
     local dir="$1"
     mkdir -p "${dir}/config" "${dir}/data" "${dir}/logs"
-    chmod 755 "${dir}" "${dir}/config" "${dir}/data" "${dir}/logs"
+    chmod 755 "${dir}" "${dir}/config"
+    chmod 777 "${dir}/data" "${dir}/logs"
 }
 
 set_cli_tls_args() {
@@ -324,7 +325,7 @@ generate_tls_materials() {
     ip_base=$(echo "$NETWORK_SUBNET" | cut -d'/' -f1 | cut -d'.' -f1-3)
     TLS_DIR="${BASE_DIR}/tls"
     mkdir -p "$TLS_DIR"
-    chmod 700 "$TLS_DIR"
+    chmod 755 "$TLS_DIR"
 
     openssl_config="${TLS_DIR}/openssl.cnf"
     generate_tls_openssl_config "$openssl_config" "$ip_base"
@@ -367,7 +368,7 @@ generate_tls_materials() {
         -sha256 >/dev/null 2>&1
 
     rm -f "${TLS_DIR}/server.csr" "${TLS_DIR}/client.csr" "${TLS_DIR}/ca.srl"
-    chmod 600 "${TLS_DIR}/ca.key" "${TLS_DIR}/server.key" "${TLS_DIR}/client.key"
+    chmod 644 "${TLS_DIR}/ca.key" "${TLS_DIR}/server.key" "${TLS_DIR}/client.key"
     chmod 644 "${TLS_DIR}/ca.crt" "${TLS_DIR}/server.crt" "${TLS_DIR}/client.crt" "$openssl_config"
 }
 
@@ -485,7 +486,7 @@ EOF
     [[ -n "$JSON_MODULE" ]] && echo "$JSON_MODULE" >> "$config_path"
     [[ -n "$BLOOM_MODULE" ]] && echo "$BLOOM_MODULE" >> "$config_path"
     [[ -n "$SEARCH_MODULE" ]] && echo "$SEARCH_MODULE" >> "$config_path"
-    chmod 640 "$config_path"
+    chmod 644 "$config_path"
 }
 
 create_acl_file() {
@@ -506,7 +507,7 @@ user sentinel-user on >$PASSWORD allchannels -@all +multi +slaveof +ping +exec +
 EOF
             ;;
     esac
-    chmod 600 "$acl_path"
+    chmod 644 "$acl_path"
 }
 
 create_sentinel_config() {
@@ -528,7 +529,7 @@ EOF
         append_tls_config "$config_path" 26379
         echo "tls-replication yes" >> "$config_path"
     fi
-    chmod 640 "$config_path"
+    chmod 644 "$config_path"
 }
 
 # Usage: run_node <name> <dir_path> <node_type> <ip_address>
