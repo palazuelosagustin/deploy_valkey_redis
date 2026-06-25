@@ -21,12 +21,14 @@ CLEAN_PREVIOUS=false
 PASSWORD="${DEPLOY_VALKEY_REDIS_PASSWORD:-}"
 NAME_SUFFIX=""
 AUTO_CLEANUP_ON_ERROR=false
+TLS_ENABLED=false
 
 # --- Variables set dynamically in main() ---
 DEPLOYMENT_ID=""
 BASE_DIR=""
 NETWORK_NAME=""
 BASE_CONTAINER_NAME=""
+TLS_DIR=""
 
 # --- Global Variables (set by functions) ---
 NETWORK_SUBNET=""
@@ -37,6 +39,7 @@ SENTINEL_COMMAND=""
 JSON_MODULE=""
 BLOOM_MODULE=""
 SEARCH_MODULE=""
+CLI_TLS_ARGS=()
 
 # --- Color Codes ---
 GREEN='\033[0;32m'
@@ -79,6 +82,7 @@ Options:
   -S <num>            Number of master shards for a cluster (default: 3).
   -R <num>            Number of replicas per shard for a cluster (default: 0).
   -p <password>       Password for Redis/Valkey auth. If omitted, one is generated.
+  -T                  Enable TLS. Certificates are generated automatically with OpenSSL.
   -c                  Clean up a specific deployment before starting a new one.
   -h                  Show this help message.
 
@@ -86,6 +90,7 @@ Example:
   $0 -c -r redis -f stack -t replica -n 2 -s 3 -v 7.2
   $0 -c -r valkey -t cluster -S 3 -R 1 -N my-cluster
   DEPLOY_VALKEY_REDIS_PASSWORD=secret123 $0 -c -r valkey -t standalone -N my-dev
+  $0 -T -r redis -t standalone -N tls-demo
 
 Available tags:
 valkey:             8.1.1, 8.1, 8
@@ -189,20 +194,33 @@ validate_inputs() {
         log_error "Replica deployments require at least 1 replica."
     fi
 
+    if [[ "$TYPE" == "replica" ]]; then
+        if (( 10 + REPLICAS > 254 )); then
+            log_error "Replica count is too large for the current IP allocation."
+        fi
+
+        if (( 100 + SENTINELS > 254 )); then
+            log_error "Sentinel count is too large for the current IP allocation."
+        fi
+    fi
+
     if [[ "$TYPE" == "cluster" ]]; then
         if (( SHARDS < 3 )); then
             log_warn "Cluster requires at least 3 master shards. Setting shards to 3."
             SHARDS=3
         fi
 
-        local total_cluster_nodes=$((SHARDS * (CLUSTER_REPLICAS + 1)))
-        if (( total_cluster_nodes > 245 )); then
-            log_error "Cluster size is too large for the current /24 network allocation."
+        if (( 20 * SHARDS + CLUSTER_REPLICAS > 254 )); then
+            log_error "Cluster size is too large for the current IP allocation."
         fi
     fi
 
     if [[ -z "$PASSWORD" ]]; then
         PASSWORD="$(generate_password)"
+    fi
+
+    if [[ "$TLS_ENABLED" == true ]] && ! command -v openssl >/dev/null 2>&1; then
+        log_error "OpenSSL is required when TLS is enabled."
     fi
 }
 
@@ -210,6 +228,147 @@ prepare_node_dirs() {
     local dir="$1"
     mkdir -p "${dir}/config" "${dir}/data" "${dir}/logs"
     chmod 755 "${dir}" "${dir}/config" "${dir}/data" "${dir}/logs"
+}
+
+set_cli_tls_args() {
+    CLI_TLS_ARGS=()
+    if [[ "$TLS_ENABLED" == true ]]; then
+        CLI_TLS_ARGS=(--tls --cacert /tls/ca.crt)
+    fi
+}
+
+append_tls_config() {
+    local config_path="$1"
+    local tls_port="$2"
+
+    if [[ "$TLS_ENABLED" != true ]]; then
+        return 0
+    fi
+
+    cat >> "$config_path" <<EOF
+port 0
+tls-port $tls_port
+tls-cert-file /tls/server.crt
+tls-key-file /tls/server.key
+tls-ca-cert-file /tls/ca.crt
+tls-auth-clients no
+EOF
+}
+
+generate_tls_openssl_config() {
+    local config_path="$1"
+    local ip_base="$2"
+    local alt_names=()
+    local alt_index=1
+
+    alt_names+=("IP.${alt_index} = 127.0.0.1")
+    alt_index=$((alt_index + 1))
+    alt_names+=("DNS.${alt_index} = localhost")
+    alt_index=$((alt_index + 1))
+
+    case "$TYPE" in
+        standalone)
+            alt_names+=("IP.${alt_index} = ${ip_base}.10")
+            ;;
+        replica)
+            alt_names+=("IP.${alt_index} = ${ip_base}.10")
+            alt_index=$((alt_index + 1))
+            for i in $(seq 1 "$REPLICAS"); do
+                alt_names+=("IP.${alt_index} = ${ip_base}.$((10 + i))")
+                alt_index=$((alt_index + 1))
+            done
+            for i in $(seq 1 "$SENTINELS"); do
+                alt_names+=("IP.${alt_index} = ${ip_base}.$((100 + i))")
+                alt_index=$((alt_index + 1))
+            done
+            ;;
+        cluster)
+            for i in $(seq 0 $((SHARDS - 1))); do
+                alt_names+=("IP.${alt_index} = ${ip_base}.$((10 + i))")
+                alt_index=$((alt_index + 1))
+                for j in $(seq 1 "$CLUSTER_REPLICAS"); do
+                    alt_names+=("IP.${alt_index} = ${ip_base}.$(((i + 1) * 20 + j))")
+                    alt_index=$((alt_index + 1))
+                done
+            done
+            ;;
+    esac
+
+    cat > "$config_path" <<EOF
+[req]
+default_bits = 2048
+prompt = no
+default_md = sha256
+distinguished_name = dn
+req_extensions = req_ext
+
+[dn]
+CN = ${DEPLOYMENT_ID}
+
+[req_ext]
+subjectAltName = @alt_names
+
+[alt_names]
+$(printf '%s\n' "${alt_names[@]}")
+EOF
+}
+
+generate_tls_materials() {
+    if [[ "$TLS_ENABLED" != true ]]; then
+        return 0
+    fi
+
+    local ip_base
+    local openssl_config
+
+    ip_base=$(echo "$NETWORK_SUBNET" | cut -d'/' -f1 | cut -d'.' -f1-3)
+    TLS_DIR="${BASE_DIR}/tls"
+    mkdir -p "$TLS_DIR"
+    chmod 700 "$TLS_DIR"
+
+    openssl_config="${TLS_DIR}/openssl.cnf"
+    generate_tls_openssl_config "$openssl_config" "$ip_base"
+
+    log_info "Generating TLS certificates in '$TLS_DIR'..."
+    openssl req -x509 -newkey rsa:2048 -nodes \
+        -keyout "${TLS_DIR}/ca.key" \
+        -out "${TLS_DIR}/ca.crt" \
+        -days 3650 \
+        -subj "/CN=${DEPLOYMENT_ID}-ca" >/dev/null 2>&1
+
+    openssl req -new -newkey rsa:2048 -nodes \
+        -keyout "${TLS_DIR}/server.key" \
+        -out "${TLS_DIR}/server.csr" \
+        -config "$openssl_config" >/dev/null 2>&1
+
+    openssl x509 -req \
+        -in "${TLS_DIR}/server.csr" \
+        -CA "${TLS_DIR}/ca.crt" \
+        -CAkey "${TLS_DIR}/ca.key" \
+        -CAcreateserial \
+        -out "${TLS_DIR}/server.crt" \
+        -days 825 \
+        -sha256 \
+        -extensions req_ext \
+        -extfile "$openssl_config" >/dev/null 2>&1
+
+    openssl req -new -newkey rsa:2048 -nodes \
+        -keyout "${TLS_DIR}/client.key" \
+        -out "${TLS_DIR}/client.csr" \
+        -subj "/CN=${DEPLOYMENT_ID}-client" >/dev/null 2>&1
+
+    openssl x509 -req \
+        -in "${TLS_DIR}/client.csr" \
+        -CA "${TLS_DIR}/ca.crt" \
+        -CAkey "${TLS_DIR}/ca.key" \
+        -CAcreateserial \
+        -out "${TLS_DIR}/client.crt" \
+        -days 825 \
+        -sha256 >/dev/null 2>&1
+
+    rm -f "${TLS_DIR}/server.csr" "${TLS_DIR}/client.csr" "${TLS_DIR}/ca.srl"
+    chmod 600 "${TLS_DIR}/ca.key" "${TLS_DIR}/server.key" "${TLS_DIR}/client.key"
+    chmod 644 "${TLS_DIR}/ca.crt" "${TLS_DIR}/server.crt" "${TLS_DIR}/client.crt" "$openssl_config"
 }
 
 create_network() {
@@ -287,6 +446,10 @@ dir /data
 aclfile /config/users.acl
 EOF
 
+    if [[ "$TLS_ENABLED" == true ]]; then
+        append_tls_config "$config_path" 6379
+    fi
+
     case "$node_type" in
         standalone)
             true
@@ -294,11 +457,13 @@ EOF
         replica_master)
             echo "masteruser replica-user" >> "$config_path"
             echo "masterauth $PASSWORD" >> "$config_path"
+            [[ "$TLS_ENABLED" == true ]] && echo "tls-replication yes" >> "$config_path"
             ;;
         replica_slave)
             echo "masteruser replica-user" >> "$config_path"
             echo "masterauth $PASSWORD" >> "$config_path"
             echo "replicaof $replicaof_ip 6379" >> "$config_path"
+            [[ "$TLS_ENABLED" == true ]] && echo "tls-replication yes" >> "$config_path"
             ;;
         cluster)
             cat >> "$config_path" <<EOF
@@ -308,6 +473,12 @@ cluster-node-timeout 5000
 requirepass $PASSWORD
 masterauth $PASSWORD
 EOF
+            if [[ "$TLS_ENABLED" == true ]]; then
+                cat >> "$config_path" <<EOF
+tls-replication yes
+tls-cluster yes
+EOF
+            fi
             ;;
     esac
 
@@ -353,6 +524,10 @@ sentinel down-after-milliseconds mymaster 5000
 sentinel failover-timeout mymaster 10000
 user default on >$PASSWORD ~* &* +@all
 EOF
+    if [[ "$TLS_ENABLED" == true ]]; then
+        append_tls_config "$config_path" 26379
+        echo "tls-replication yes" >> "$config_path"
+    fi
     chmod 640 "$config_path"
 }
 
@@ -362,6 +537,11 @@ run_node() {
     local dir_path="$2"
     local node_type="$3"
     local ip_address="$4"
+    local volume_args=(
+        -v "${dir_path}/data:/data"
+        -v "${dir_path}/config:/config"
+        -v "${dir_path}/logs:/logs"
+    )
 
     local cmd="$BINARY"
     local conf_file_name="server.conf"
@@ -371,6 +551,10 @@ run_node() {
         conf_file_name="sentinel.conf"
     fi
 
+    if [[ "$TLS_ENABLED" == true ]]; then
+        volume_args+=(-v "${TLS_DIR}:/tls:ro")
+    fi
+
     log_info "Starting container '$name' with IP ${ip_address}..."
     docker run -d --restart always \
         --name "$name" \
@@ -378,9 +562,7 @@ run_node() {
         --ip "$ip_address" \
         --label "db-deploy-script=true" \
         --label "deployment_id=${DEPLOYMENT_ID}" \
-        -v "${dir_path}/data:/data" \
-        -v "${dir_path}/config:/config" \
-        -v "${dir_path}/logs:/logs" \
+        "${volume_args[@]}" \
         "${IMAGE_NAME}:${VERSION}" "$cmd" "/config/${conf_file_name}" >/dev/null
 }
 
@@ -390,7 +572,7 @@ wait_for_ready() {
 
     log_info "Waiting for '$container_name' to be ready..."
     for _ in {1..20}; do
-        if docker exec "$container_name" "$CLI_COMMAND" "${extra_args[@]}" --no-auth-warning PING 2>/dev/null | grep -q "PONG"; then
+        if docker exec "$container_name" "$CLI_COMMAND" "${CLI_TLS_ARGS[@]}" "${extra_args[@]}" --no-auth-warning PING 2>/dev/null | grep -q "PONG"; then
             log_info "'$container_name' is ready."
             return 0
         fi
@@ -501,7 +683,7 @@ deploy_cluster() {
 
     # Create Cluster
     log_info "Creating cluster with seeds: $seeds"
-    docker exec "${BASE_CONTAINER_NAME}-sh0-node0" "$CLI_COMMAND" --no-auth-warning -a "$PASSWORD" --cluster create $seeds --cluster-yes
+    docker exec "${BASE_CONTAINER_NAME}-sh0-node0" "$CLI_COMMAND" "${CLI_TLS_ARGS[@]}" --no-auth-warning -a "$PASSWORD" --cluster create $seeds --cluster-yes
 
     # Deploy and add Replica Nodes
     if (( CLUSTER_REPLICAS > 0 )); then
@@ -522,8 +704,9 @@ deploy_cluster() {
                 wait_for_ready "$container_name" -a "$PASSWORD"
 
                 log_info "Adding node $container_name as replica for $master_name"
-                local master_id=$(docker exec "$master_name" "$CLI_COMMAND" --no-auth-warning -a "$PASSWORD" CLUSTER MYID | tr -d '\r')
-                docker exec "$container_name" "$CLI_COMMAND" --no-auth-warning -a "$PASSWORD" --cluster add-node "${replica_ip}:6379" "${master_ip}:6379" --cluster-slave --cluster-master-id "$master_id"
+                local master_id
+                master_id=$(docker exec "$master_name" "$CLI_COMMAND" "${CLI_TLS_ARGS[@]}" --no-auth-warning -a "$PASSWORD" CLUSTER MYID | tr -d '\r')
+                docker exec "$container_name" "$CLI_COMMAND" "${CLI_TLS_ARGS[@]}" --no-auth-warning -a "$PASSWORD" --cluster add-node "${replica_ip}:6379" "${master_ip}:6379" --cluster-slave --cluster-master-id "$master_id"
             done
         done
     fi
@@ -542,25 +725,44 @@ print_final_status() {
     if [[ "$TYPE" == "cluster" ]]; then
         log_info "Cluster Nodes Status:"
         sleep 2 # Allow cluster state to propagate
-        docker exec "${BASE_CONTAINER_NAME}-sh0-node0" "$CLI_COMMAND" --no-auth-warning -a "$PASSWORD" CLUSTER NODES
+        docker exec "${BASE_CONTAINER_NAME}-sh0-node0" "$CLI_COMMAND" "${CLI_TLS_ARGS[@]}" --no-auth-warning -a "$PASSWORD" CLUSTER NODES
     fi
 
     echo -e "${YELLOW}------------------------------------------------------------------${NC}"
     log_info "Connect using ${CLI_COMMAND}:"
     echo "  Password: $PASSWORD"
+    if [[ "$TLS_ENABLED" == true ]]; then
+        echo "  TLS CA certificate: ${TLS_DIR}/ca.crt"
+    fi
     case "$TYPE" in
         standalone)
-            echo "  docker run --rm -it --network ${NETWORK_NAME} ${IMAGE_NAME}:${VERSION} ${CLI_COMMAND} -h $(get_container_data "${BASE_CONTAINER_NAME}-standalone" 'ip') -a $PASSWORD"
+            if [[ "$TLS_ENABLED" == true ]]; then
+                echo "  docker exec -it ${BASE_CONTAINER_NAME}-standalone ${CLI_COMMAND} --tls --cacert /tls/ca.crt -h $(get_container_data "${BASE_CONTAINER_NAME}-standalone" 'ip') -a $PASSWORD"
+            else
+                echo "  docker run --rm -it --network ${NETWORK_NAME} ${IMAGE_NAME}:${VERSION} ${CLI_COMMAND} -h $(get_container_data "${BASE_CONTAINER_NAME}-standalone" 'ip') -a $PASSWORD"
+            fi
             ;;
         replica)
             echo "  # Connect to Master:"
-            echo "  docker run --rm -it --network ${NETWORK_NAME} ${IMAGE_NAME}:${VERSION} ${CLI_COMMAND} -h $(get_container_data "${BASE_CONTAINER_NAME}-node-0" 'ip') -a $PASSWORD"
+            if [[ "$TLS_ENABLED" == true ]]; then
+                echo "  docker exec -it ${BASE_CONTAINER_NAME}-node-0 ${CLI_COMMAND} --tls --cacert /tls/ca.crt -h $(get_container_data "${BASE_CONTAINER_NAME}-node-0" 'ip') -a $PASSWORD"
+            else
+                echo "  docker run --rm -it --network ${NETWORK_NAME} ${IMAGE_NAME}:${VERSION} ${CLI_COMMAND} -h $(get_container_data "${BASE_CONTAINER_NAME}-node-0" 'ip') -a $PASSWORD"
+            fi
             echo "  # Connect via Sentinel (for failover):"
-            echo "  docker run --rm -it --network ${NETWORK_NAME} ${IMAGE_NAME}:${VERSION} ${CLI_COMMAND} -h $(get_container_data "${BASE_CONTAINER_NAME}-sentinel-1" 'ip') -p 26379 -a $PASSWORD"
+            if [[ "$TLS_ENABLED" == true ]]; then
+                echo "  docker exec -it ${BASE_CONTAINER_NAME}-sentinel-1 ${CLI_COMMAND} --tls --cacert /tls/ca.crt -h $(get_container_data "${BASE_CONTAINER_NAME}-sentinel-1" 'ip') -p 26379 -a $PASSWORD"
+            else
+                echo "  docker run --rm -it --network ${NETWORK_NAME} ${IMAGE_NAME}:${VERSION} ${CLI_COMMAND} -h $(get_container_data "${BASE_CONTAINER_NAME}-sentinel-1" 'ip') -p 26379 -a $PASSWORD"
+            fi
             ;;
         cluster)
             echo "  # Connect to any node in the cluster with -c for cluster mode:"
-            echo "  docker run --rm -it --network ${NETWORK_NAME} ${IMAGE_NAME}:${VERSION} ${CLI_COMMAND} -c -h $(get_container_data "${BASE_CONTAINER_NAME}-sh0-node0" 'ip') -a $PASSWORD"
+            if [[ "$TLS_ENABLED" == true ]]; then
+                echo "  docker exec -it ${BASE_CONTAINER_NAME}-sh0-node0 ${CLI_COMMAND} --tls --cacert /tls/ca.crt -c -h $(get_container_data "${BASE_CONTAINER_NAME}-sh0-node0" 'ip') -a $PASSWORD"
+            else
+                echo "  docker run --rm -it --network ${NETWORK_NAME} ${IMAGE_NAME}:${VERSION} ${CLI_COMMAND} -c -h $(get_container_data "${BASE_CONTAINER_NAME}-sh0-node0" 'ip') -a $PASSWORD"
+            fi
             ;;
     esac
 
@@ -576,7 +778,7 @@ print_final_status() {
 main() {
     trap handle_error ERR
 
-    while getopts ":r:t:f:v:n:s:S:R:N:p:ch" opt; do
+    while getopts ":r:t:f:v:n:s:S:R:N:p:Tch" opt; do
         case ${opt} in
             r) REPO="$OPTARG" ;;
             t) TYPE="$OPTARG" ;;
@@ -588,6 +790,7 @@ main() {
             R) CLUSTER_REPLICAS=$OPTARG ;;
             N) NAME_SUFFIX="$OPTARG" ;;
             p) PASSWORD="$OPTARG" ;;
+            T) TLS_ENABLED=true ;;
             c) CLEAN_PREVIOUS=true ;;
             h) usage ;;
             \?) log_error "Invalid option: -$OPTARG" ;;
@@ -614,8 +817,10 @@ main() {
 
     validate_inputs
     set_image_config
-    create_network
+    set_cli_tls_args
     AUTO_CLEANUP_ON_ERROR=true
+    create_network
+    generate_tls_materials
 
     case "$TYPE" in
         standalone) deploy_standalone ;;
