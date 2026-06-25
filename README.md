@@ -1,5 +1,5 @@
 # deploy_valkey_redis
-Bash script to deploy different flavors of redis and valkey with dcocker containers
+Bash script to deploy different Redis and Valkey topologies with Docker containers.
 
 # Installation
 
@@ -30,11 +30,19 @@ Options:
     -s <num>            Number of sentinels for a replica set (default: 3).
     -S <num>            Number of master shards for a cluster (default: 3).
     -R <num>            Number of replicas per shard for a cluster (default: 0).
+    -p <password>       Password for Redis/Valkey auth. If omitted, one is generated.
     -c                  Clean up a specific deployment before starting a new one.
     -h                  Show this help message.
+
+Behavior notes:
+
+    - Inputs are validated before Docker resources are created.
+    - If deployment fails after resources are created, the script cleans them up automatically.
+    - The generated or provided password is printed in the final summary.
+    - You can also provide the password through the DEPLOY_VALKEY_REDIS_PASSWORD environment variable.
 
 Example:
 
     deploy_valkey_redis.sh -c -r redis -f stack -t replica -n 2 -s 3 -v 7.2
     deploy_valkey_redis.sh -c -r valkey -t cluster -S 3 -R 1 -N my-cluster
-    deploy_valkey_redis.sh -c -N my-cluster
+    DEPLOY_VALKEY_REDIS_PASSWORD=secret123 ./deploy_valkey_redis.sh -c -r valkey -t standalone -N my-dev

@@ -1,5 +1,5 @@
 #!/bin/bash
-# set -euo pipefail
+set -euo pipefail
 
 # check if docker is installed
 if ! command -v docker &> /dev/null; then
@@ -18,8 +18,9 @@ SENTINELS=3
 SHARDS=3
 CLUSTER_REPLICAS=0
 CLEAN_PREVIOUS=false
-PASSWORD="password"
+PASSWORD="${DEPLOY_VALKEY_REDIS_PASSWORD:-}"
 NAME_SUFFIX=""
+AUTO_CLEANUP_ON_ERROR=false
 
 # --- Variables set dynamically in main() ---
 DEPLOYMENT_ID=""
@@ -77,13 +78,14 @@ Options:
   -s <num>            Number of sentinels for a replica set (default: 3).
   -S <num>            Number of master shards for a cluster (default: 3).
   -R <num>            Number of replicas per shard for a cluster (default: 0).
+  -p <password>       Password for Redis/Valkey auth. If omitted, one is generated.
   -c                  Clean up a specific deployment before starting a new one.
   -h                  Show this help message.
 
 Example:
   $0 -c -r redis -f stack -t replica -n 2 -s 3 -v 7.2
   $0 -c -r valkey -t cluster -S 3 -R 1 -N my-cluster
-  $0 -c -r valkey -t cluster -S 3 -R 1 -N my-cluster
+  DEPLOY_VALKEY_REDIS_PASSWORD=secret123 $0 -c -r valkey -t standalone -N my-dev
 
 Available tags:
 valkey:             8.1.1, 8.1, 8
@@ -97,10 +99,117 @@ EOF
 
 cleanup() {
     log_info "Cleaning up deployment '$DEPLOYMENT_ID'..."
-    docker rm -f $(docker ps -aq --filter "label=db-deploy-script=true" --filter "label=deployment_id=${DEPLOYMENT_ID}") > /dev/null 2>&1
-    docker network rm "$NETWORK_NAME" > /dev/null 2>&1
-    rm -rf "${BASE_DIR}" > /dev/null 2>&1
+    local container_ids=()
+    if [[ -n "$DEPLOYMENT_ID" ]]; then
+        while IFS= read -r container_id; do
+            [[ -n "$container_id" ]] && container_ids+=("$container_id")
+        done < <(docker ps -aq --filter "label=db-deploy-script=true" --filter "label=deployment_id=${DEPLOYMENT_ID}")
+    fi
+
+    if (( ${#container_ids[@]} > 0 )); then
+        docker rm -f "${container_ids[@]}" > /dev/null 2>&1 || true
+    fi
+
+    if [[ -n "$NETWORK_NAME" ]]; then
+        docker network rm "$NETWORK_NAME" > /dev/null 2>&1 || true
+    fi
+
+    if [[ -n "${BASE_DIR:-}" && "$BASE_DIR" != "/" && "$BASE_DIR" != "$HOME" ]]; then
+        rm -rf "${BASE_DIR}" > /dev/null 2>&1 || true
+    fi
     log_info "Cleanup complete."
+}
+
+handle_error() {
+    local exit_code=$?
+    trap - ERR
+    echo -e "${RED}[ERROR]${NC} Deployment failed." >&2
+    if [[ "$AUTO_CLEANUP_ON_ERROR" == true ]]; then
+        cleanup
+    fi
+    exit "$exit_code"
+}
+
+generate_password() {
+    if command -v openssl >/dev/null 2>&1; then
+        openssl rand -base64 24 | tr -d '\n'
+    else
+        local generated_password
+        set +o pipefail
+        generated_password="$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 24)"
+        set -o pipefail
+        printf '%s' "$generated_password"
+    fi
+}
+
+require_integer() {
+    local name="$1"
+    local value="$2"
+    if [[ ! "$value" =~ ^[0-9]+$ ]]; then
+        log_error "$name must be a non-negative integer. Got '$value'."
+    fi
+}
+
+validate_name_suffix() {
+    if [[ -n "$NAME_SUFFIX" && ! "$NAME_SUFFIX" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+        log_error "Deployment name may contain only letters, numbers, dot, underscore, and dash."
+    fi
+}
+
+validate_inputs() {
+    if [[ -z "$REPO" || -z "$TYPE" ]]; then
+        log_warn "Missing required arguments."
+        usage
+    fi
+
+    if [[ "$REPO" != "redis" && "$REPO" != "valkey" ]]; then
+        log_error "Invalid repo: '$REPO'. Must be 'redis' or 'valkey'."
+    fi
+
+    if [[ "$TYPE" != "standalone" && "$TYPE" != "replica" && "$TYPE" != "cluster" ]]; then
+        log_error "Invalid deployment type '$TYPE'. Use 'standalone', 'replica', or 'cluster'."
+    fi
+
+    require_integer "Replicas" "$REPLICAS"
+    require_integer "Sentinels" "$SENTINELS"
+    require_integer "Shards" "$SHARDS"
+    require_integer "Cluster replicas" "$CLUSTER_REPLICAS"
+    validate_name_suffix
+
+    if [[ -n "$FLAVOR" ]]; then
+        case "$REPO:$FLAVOR" in
+            redis:stack|valkey:extensions) ;;
+            *)
+                log_error "Invalid flavor '$FLAVOR' for repo '$REPO'."
+                ;;
+        esac
+    fi
+
+    if [[ "$TYPE" == "replica" && "$REPLICAS" -lt 1 ]]; then
+        log_error "Replica deployments require at least 1 replica."
+    fi
+
+    if [[ "$TYPE" == "cluster" ]]; then
+        if (( SHARDS < 3 )); then
+            log_warn "Cluster requires at least 3 master shards. Setting shards to 3."
+            SHARDS=3
+        fi
+
+        local total_cluster_nodes=$((SHARDS * (CLUSTER_REPLICAS + 1)))
+        if (( total_cluster_nodes > 245 )); then
+            log_error "Cluster size is too large for the current /24 network allocation."
+        fi
+    fi
+
+    if [[ -z "$PASSWORD" ]]; then
+        PASSWORD="$(generate_password)"
+    fi
+}
+
+prepare_node_dirs() {
+    local dir="$1"
+    mkdir -p "${dir}/config" "${dir}/data" "${dir}/logs"
+    chmod 755 "${dir}" "${dir}/config" "${dir}/data" "${dir}/logs"
 }
 
 create_network() {
@@ -205,6 +314,7 @@ EOF
     [[ -n "$JSON_MODULE" ]] && echo "$JSON_MODULE" >> "$config_path"
     [[ -n "$BLOOM_MODULE" ]] && echo "$BLOOM_MODULE" >> "$config_path"
     [[ -n "$SEARCH_MODULE" ]] && echo "$SEARCH_MODULE" >> "$config_path"
+    chmod 640 "$config_path"
 }
 
 create_acl_file() {
@@ -225,6 +335,7 @@ user sentinel-user on >$PASSWORD allchannels -@all +multi +slaveof +ping +exec +
 EOF
             ;;
     esac
+    chmod 600 "$acl_path"
 }
 
 create_sentinel_config() {
@@ -242,6 +353,7 @@ sentinel down-after-milliseconds mymaster 5000
 sentinel failover-timeout mymaster 10000
 user default on >$PASSWORD ~* &* +@all
 EOF
+    chmod 640 "$config_path"
 }
 
 # Usage: run_node <name> <dir_path> <node_type> <ip_address>
@@ -274,11 +386,11 @@ run_node() {
 
 wait_for_ready() {
     local container_name="$1"
-    local pass_arg=${2:-""}
+    local extra_args=("${@:2}")
 
     log_info "Waiting for '$container_name' to be ready..."
     for _ in {1..20}; do
-        if docker exec "$container_name" "$CLI_COMMAND" $pass_arg --no-auth-warning PING 2>/dev/null | grep -q "PONG"; then
+        if docker exec "$container_name" "$CLI_COMMAND" "${extra_args[@]}" --no-auth-warning PING 2>/dev/null | grep -q "PONG"; then
             log_info "'$container_name' is ready."
             return 0
         fi
@@ -306,11 +418,11 @@ deploy_standalone() {
 
 
     local dir="${BASE_DIR}/standalone"
-    mkdir -p "${dir}"/{config,data,logs} && chmod -R 777 "${dir}"/{config,data,logs}
+    prepare_node_dirs "${dir}"
     create_server_config "${dir}/config/server.conf" "standalone"
     create_acl_file "${dir}/config/users.acl" "standalone"
     run_node "$container_name" "$dir" "server" "$ip"
-    wait_for_ready "$container_name" "-a $PASSWORD"
+    wait_for_ready "$container_name" -a "$PASSWORD"
 }
 
 deploy_replica_set() {
@@ -323,11 +435,11 @@ deploy_replica_set() {
     local master_name="node-0"
     local container_name="${BASE_CONTAINER_NAME}-$master_name"
     local master_dir="${BASE_DIR}/${master_name}"
-    mkdir -p "${master_dir}"/{config,data,logs} && chmod -R 777 "${master_dir}"/{config,data,logs}
+    prepare_node_dirs "${master_dir}"
     create_server_config "${master_dir}/config/server.conf" "replica_master"
     create_acl_file "${master_dir}/config/users.acl" "replica"
     run_node "$container_name" "$master_dir" "server" "$master_ip"
-    wait_for_ready "$container_name" "-a $PASSWORD"
+    wait_for_ready "$container_name" -a "$PASSWORD"
 
     # Deploy Replicas
     for i in $(seq 1 "$REPLICAS"); do
@@ -335,11 +447,11 @@ deploy_replica_set() {
         local container_name="${BASE_CONTAINER_NAME}-${replica_name}"
         local replica_dir="${BASE_DIR}/${replica_name}"
         local replica_ip="${ip_base}.$((10 + i))"
-        mkdir -p "${replica_dir}"/{config,data,logs} && chmod -R 777 "${replica_dir}"/{config,data,logs}
+        prepare_node_dirs "${replica_dir}"
         create_server_config "${replica_dir}/config/server.conf" "replica_slave" "$master_ip"
         cp "${master_dir}/config/users.acl" "${replica_dir}/config/users.acl"
         run_node "$container_name" "$replica_dir" "server" "$replica_ip"
-        wait_for_ready "$container_name" "-a $PASSWORD"
+        wait_for_ready "$container_name" -a "$PASSWORD"
     done
 
     # Deploy Sentinels
@@ -350,10 +462,10 @@ deploy_replica_set() {
             local container_name="${BASE_CONTAINER_NAME}-${sentinel_name}"
             local sentinel_dir="${BASE_DIR}/${sentinel_name}"
             local sentinel_ip="${ip_base}.$((100 + i))"
-            mkdir -p "${sentinel_dir}"/{config,data,logs} && chmod -R 777 "${sentinel_dir}"/{config,data,logs}
+            prepare_node_dirs "${sentinel_dir}"
             create_sentinel_config "${sentinel_dir}/config/sentinel.conf" "$master_ip" "$quorum"
             run_node "$container_name" "$sentinel_dir" "sentinel" "$sentinel_ip"
-            wait_for_ready "$container_name" "-a $PASSWORD -p 26379"
+            wait_for_ready "$container_name" -a "$PASSWORD" -p 26379
         done
     fi
 }
@@ -373,16 +485,17 @@ deploy_cluster() {
         local master_ip="${ip_base}.$((10 + i))"
         master_ips+=("$master_ip")
 
-        mkdir -p "${master_dir}"/{config,data,logs} && chmod -R 777 "${master_dir}"/{config,data,logs}
+        prepare_node_dirs "${master_dir}"
         create_server_config "${master_dir}/config/server.conf" "cluster"
         create_acl_file "${master_dir}/config/users.acl" "cluster"
         run_node "$container_name" "$master_dir" "server" "$master_ip"
-        wait_for_ready "$container_name" "-a $PASSWORD"
+        wait_for_ready "$container_name" -a "$PASSWORD"
     done
 
     # Wait for all masters and build seeds list
     for i in $(seq 0 $((SHARDS - 1))); do
-        wait_for_ready "$container_name" "-a $PASSWORD"
+        local container_name="${BASE_CONTAINER_NAME}-sh${i}-node0"
+        wait_for_ready "$container_name" -a "$PASSWORD"
         seeds+="${master_ips[i]}:6379 "
     done
 
@@ -402,11 +515,11 @@ deploy_cluster() {
                 local replica_dir="${BASE_DIR}/shard${i}/node${j}"
                 local replica_ip="${ip_base}.$(( (i+1)*20 + j ))"
 
-                mkdir -p "${replica_dir}"/{config,data,logs} && chmod -R 777 "${replica_dir}"/{config,data,logs}
+                prepare_node_dirs "${replica_dir}"
                 create_server_config "${replica_dir}/config/server.conf" "cluster"
                 cp "${BASE_DIR}/shard${i}/node0/config/users.acl" "${replica_dir}/config/users.acl"
                 run_node "$container_name" "$replica_dir" "server" "$replica_ip"
-                wait_for_ready "$container_name" "-a $PASSWORD"
+                wait_for_ready "$container_name" -a "$PASSWORD"
 
                 log_info "Adding node $container_name as replica for $master_name"
                 local master_id=$(docker exec "$master_name" "$CLI_COMMAND" --no-auth-warning -a "$PASSWORD" CLUSTER MYID | tr -d '\r')
@@ -429,11 +542,12 @@ print_final_status() {
     if [[ "$TYPE" == "cluster" ]]; then
         log_info "Cluster Nodes Status:"
         sleep 2 # Allow cluster state to propagate
-        docker exec ${BASE_CONTAINER_NAME}-sh0-node0 "$CLI_COMMAND" --no-auth-warning -a "$PASSWORD" CLUSTER NODES
+        docker exec "${BASE_CONTAINER_NAME}-sh0-node0" "$CLI_COMMAND" --no-auth-warning -a "$PASSWORD" CLUSTER NODES
     fi
 
     echo -e "${YELLOW}------------------------------------------------------------------${NC}"
     log_info "Connect using ${CLI_COMMAND}:"
+    echo "  Password: $PASSWORD"
     case "$TYPE" in
         standalone)
             echo "  docker run --rm -it --network ${NETWORK_NAME} ${IMAGE_NAME}:${VERSION} ${CLI_COMMAND} -h $(get_container_data "${BASE_CONTAINER_NAME}-standalone" 'ip') -a $PASSWORD"
@@ -460,7 +574,9 @@ print_final_status() {
 # --- Main Execution Logic ---
 
 main() {
-    while getopts ":r:t:f:v:n:s:S:R:N:ch" opt; do
+    trap handle_error ERR
+
+    while getopts ":r:t:f:v:n:s:S:R:N:p:ch" opt; do
         case ${opt} in
             r) REPO="$OPTARG" ;;
             t) TYPE="$OPTARG" ;;
@@ -471,6 +587,7 @@ main() {
             S) SHARDS=$OPTARG ;;
             R) CLUSTER_REPLICAS=$OPTARG ;;
             N) NAME_SUFFIX="$OPTARG" ;;
+            p) PASSWORD="$OPTARG" ;;
             c) CLEAN_PREVIOUS=true ;;
             h) usage ;;
             \?) log_error "Invalid option: -$OPTARG" ;;
@@ -495,28 +612,19 @@ main() {
         fi
     fi
 
-    if [[ -z "$REPO" ]] || [[ -z "$TYPE" ]]; then
-        log_warn "Missing required arguments."
-        usage
-    else
-        create_network
-        set_image_config
+    validate_inputs
+    set_image_config
+    create_network
+    AUTO_CLEANUP_ON_ERROR=true
 
-        case "$TYPE" in
-            standalone) deploy_standalone ;;
-            replica) deploy_replica_set ;;
-            cluster)
-                if (( SHARDS < 3 )); then
-                    log_warn "Cluster requires at least 3 master shards. Setting shards to 3."
-                    SHARDS=3
-                fi
-                deploy_cluster
-                ;;
-            *) log_error "Invalid deployment type '$TYPE'. Use 'standalone', 'replica', or 'cluster'." ;;
-        esac
+    case "$TYPE" in
+        standalone) deploy_standalone ;;
+        replica) deploy_replica_set ;;
+        cluster) deploy_cluster ;;
+    esac
 
-        print_final_status
-    fi
+    AUTO_CLEANUP_ON_ERROR=false
+    print_final_status
 }
 
 main "$@"
